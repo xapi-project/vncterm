@@ -124,6 +124,8 @@ struct VncClientState
     size_t read_handler_expect;
 
     struct vnc_pending_messages vpm;
+
+    uint64_t *update_row;	/* outstanding updates */
 };
 
 #define VCS_INUSE(vcs) ((vcs) && (vcs)->csock != -1)
@@ -145,7 +147,6 @@ struct VncState
     struct VncClientState *vcs[MAX_CLIENTS];
 
     int dirty_pixel_shift;
-    uint64_t *update_row;	/* outstanding updates */
     int has_update;		/* there's outstanding updates in the
 				 * visible area */
 
@@ -164,7 +165,6 @@ struct VncState
     /* input */
     uint8_t modifiers_state[256];
 
-    int update_requested;
     int send_resize;
 
     char *server_cut_text;
@@ -293,8 +293,12 @@ static void set_bits_in_row(VncState *vs, uint64_t *row,
 static void vnc_dpy_update(DisplayState *ds, int x, int y, int w, int h)
 {
     VncState *vs = ds->opaque;
+    unsigned int i;
 
-    set_bits_in_row(vs, vs->update_row, x, y, w, h);
+    for (i = 0; i < MAX_CLIENTS; i++)
+	if (VCS_ACTIVE(vs->vcs[i]))
+	    set_bits_in_row(vs, vs->vcs[i]->update_row, x, y, w, h);
+
     vs->has_update = 1;
 }
 
@@ -393,11 +397,19 @@ static void vnc_dpy_resize(DisplayState *ds, int w, int h)
 
     if (w != ds->width || h != ds->height || w * vs->depth != ds->linesize) {
 	free(ds->data);
-	free(vs->update_row);
 	ds->data = qemu_mallocz(w * h * vs->depth);
-	vs->update_row = qemu_mallocz(h * sizeof(vs->update_row[0]));
 
-	if (ds->data == NULL || /*vs->dirty_row == NULL || */vs->update_row == NULL) {
+        for (i = 0; i < MAX_CLIENTS; i++) {
+	    if (!vs->vcs[i])
+                continue;
+            free(vs->vcs[i]->update_row);
+            vs->vcs[i]->update_row = qemu_mallocz(h * sizeof(vs->vcs[i]->update_row[0]));
+            if (!vs->vcs[i]->update_row) {
+	        fprintf(stderr, "vnc: memory allocation failed\n");
+	        exit(1);
+            }
+        }
+	if (ds->data == NULL) {
 	    fprintf(stderr, "vnc: memory allocation failed\n");
 	    exit(1);
 	}
@@ -430,35 +442,36 @@ static void vnc_write_pixels_copy(struct VncClientState *vcs, void *pixels,
 static void vnc_convert_pixel(struct VncClientState *vcs, uint8_t *buf,
                   uint32_t v)
 {
-    uint8_t r, g, b;
+    uint32_t r, g, b;
     r = ((v >> vcs->red_shift1) & vcs->red_max1) * (vcs->red_max + 1) / (vcs->red_max1 + 1);
     g = ((v >> vcs->green_shift1) & vcs->green_max1) * (vcs->green_max + 1) / (vcs->green_max1 + 1);
     b = ((v >> vcs->blue_shift1) & vcs->blue_max1) * (vcs->blue_max + 1) / (vcs->blue_max1 + 1);
+    v = (r << vcs->red_shift) | (g << vcs->green_shift) | (b << vcs->blue_shift);
     switch(vcs->pix_bpp) {
     case 1:
-        buf[0] = (r << vcs->red_shift) | (g << vcs->green_shift) | (b << vcs->blue_shift);
+        buf[0] = (uint8_t) v;
         break;
     case 2:
-    {
-        uint16_t *p = (uint16_t *) buf;
-        *p = (r << vcs->red_shift) | (g << vcs->green_shift) | (b << vcs->blue_shift);
         if (vcs->pix_big_endian) {
-            *p = htons(*p);
+            buf[0] = v >> 8;
+            buf[1] = v;
+        } else {
+            buf[1] = v >> 8;
+            buf[0] = v;
         }
-    }
         break;
     default:
     case 4:
         if (vcs->pix_big_endian) {
-            buf[0] = 255;
-            buf[1] = r;
-            buf[2] = g;
-            buf[3] = b;
+            buf[0] = v >> 24;
+            buf[1] = v >> 16;
+            buf[2] = v >> 8;
+            buf[3] = v;
         } else {
-            buf[0] = b;
-            buf[1] = g;
-            buf[2] = r;
-            buf[3] = 255;
+            buf[3] = v >> 24;
+            buf[2] = v >> 16;
+            buf[1] = v >> 8;
+            buf[0] = v;
         }
         break;
     }
@@ -661,42 +674,46 @@ static void hextile_enc_cord(uint8_t *ptr, int x, int y, int w, int h)
 #undef BPP
 #undef GENERIC
 
-static void send_framebuffer_update(VncState *vs, int x, int y, int w, int h)
+static void send_framebuffer_update(struct VncClientState *vc, int x, int y, int w, int h)
 {
     struct vnc_pm_region_update *rup;
+
+    rup = malloc(sizeof(struct vnc_pm_region_update));
+    if (rup == NULL)
+        return;			/* XXX */
+
+    rup->next = NULL;
+    rup->x = x;
+    rup->y = y;
+    rup->w = w;
+    rup->h = h;
+
+    *vc->vpm.vpm_region_updates_last = rup;
+    vc->vpm.vpm_region_updates_last = &rup->next;
+    dprintf("created rup %d %p %d %d %d %d %d %d\n", vc->csock,
+	    rup, x, y, w, h, vc->pix_bpp, vc->vs->depth);
+}
+
+static void send_framebuffer_update_all(VncState *vs, int x, int y, int w, int h)
+{
     int i;
 
     for (i = 0; i < MAX_CLIENTS; i++) {
 	if (!VCS_ACTIVE(vs->vcs[i]))
 	    continue;
-
-	rup = malloc(sizeof(struct vnc_pm_region_update));
-	if (rup == NULL)
-	    continue;			/* XXX */
-
-	rup->next = NULL;
-	rup->x = x;
-	rup->y = y;
-	rup->w = w;
-	rup->h = h;
-
-	*vs->vcs[i]->vpm.vpm_region_updates_last = rup;
-	vs->vcs[i]->vpm.vpm_region_updates_last = &rup->next;
-	dprintf("created rup %d %p %d %d %d %d %d %d\n", vs->vcs[i]->csock,
-		rup, x, y, w, h, vs->vcs[i]->pix_bpp, vs->depth);
+	send_framebuffer_update(vs->vcs[i], x, y, w, h);
     }
 }
 
-static inline int find_update_height(VncState *vs, int y, int maxy,
-				     uint64_t mask)
+ 
+static inline int find_update_height(VncState *vs, uint64_t *row,
+				     int y, int maxy, uint64_t mask)
 {
     int h = 1;
 
-    while (vs->update_row[y + h] & mask) {
-	vs->update_row[y + h] &= ~mask;
+    while (y + h < maxy && row[y + h] & mask) {
+	row[y + h] &= ~mask;
 	h++;
-	if (y + h == maxy)
-	    break;
     }
 
     return h;
@@ -706,56 +723,19 @@ static void _vnc_update_client(void *opaque)
 {
     VncState *vs = opaque;
     int64_t now;
-    int y;
-    uint64_t width_mask;
-    int maxx, maxy;
-    int new_rectangles;
 
     now = vs->ds->get_clock();
-
-    if (vs->ds->width != DP2X(vs, DIRTY_PIXEL_BITS))
-	width_mask = (1ULL << X2DP_UP(vs, vs->ds->width)) - 1;
-    else
-	width_mask = ~(0ULL);
 
     if (!vs->has_update || vs->visible_y >= vs->ds->height 
 	|| vs->visible_x >= vs->ds->width)
 	goto backoff;
 
+    /* mark no updated so updater can schedule another timer when needed */
+    vs->has_update = 0;
     vnc_send_resize(vs->ds);
-
-    maxy = vs->visible_y + vs->visible_h;
-    if (maxy > vs->ds->height)
-	maxy = vs->ds->height;
-    maxx = vs->visible_x + vs->visible_w;
-    if (maxx > vs->ds->width)
-	maxx = vs->ds->width;
-
-    new_rectangles = 0;
-
-    for (y = vs->visible_y; y < maxy; y++) {
-	int x, h;
-	for (x = X2DP_DOWN(vs, vs->visible_x);
-	     x < X2DP_UP(vs, maxx); x++) {
-	    uint64_t mask = 1ULL << x;
-	    if (vs->update_row[y] & mask) {
-		h = find_update_height(vs, y, maxy, mask);
-		if (h != 0) {
-		    send_framebuffer_update(vs, DP2X(vs, x), y,
-					    DP2X(vs, 1), h);
-		    new_rectangles++;
-		}
-	    }
-	}
-	vs->update_row[y] = 0;
-    }
-    if (new_rectangles == 0)
-	goto backoff;
 
     vnc_write_pending_all(vs);
 
-    vs->update_requested = 0;
-    vs->has_update = 0;
     vs->last_update_time = now;
 
     vs->timer_interval /= 2;
@@ -782,13 +762,12 @@ static void _vnc_update_client(void *opaque)
 	       update rectangle instead. */
             vnc_send_resize(vs->ds);
             dprintf("send null update\n");
-	    send_framebuffer_update(vs, 0, 0, 1, 1);
+	    send_framebuffer_update_all(vs, 0, 0, 1, 1);
 	    vnc_write_pending_all(vs);
 	    vs->last_update_time = now;
 	    return;
 	}
     }
-    vs->update_requested = 1;
     vs->ds->set_timer(vs->timer, now + vs->timer_interval);
     return;
 }
@@ -798,6 +777,7 @@ static void vnc_set_server_text(DisplayState *ds, char *text)
     VncState *vs = ds->opaque;
     int i;
 
+    if (!text) return;
     if (vs->server_cut_text)
 	free(vs->server_cut_text);
     vs->server_cut_text = text;
@@ -819,7 +799,6 @@ static void vnc_update_client(void *opaque)
 static void vnc_timer_init(VncState *vs)
 {
     if (vs->timer == NULL) {
-        vs->update_requested = 1;
 	vs->timer = vs->ds->init_timer(vnc_update_client, vs);
 	vs->timer_interval = VNC_REFRESH_INTERVAL_BASE;
     }
@@ -843,7 +822,7 @@ static int vnc_client_io_error(struct VncClientState *vcs, int ret,
 {
     struct VncState *vs = vcs->vs;
 
-    if (ret != 0 && ret != -1)
+    if (ret > 0)
 	return ret;
 
     if (ret == -1 && (last_errno == EINTR || last_errno == EAGAIN))
@@ -871,6 +850,7 @@ static int vnc_process_messages(struct VncClientState *vcs)
 {
     struct vnc_pending_messages *vpm;
     struct VncState *vs = vcs->vs;
+    int maxx, maxy, y;
 
     vpm = &vcs->vpm;
     if (vpm == NULL)
@@ -904,6 +884,30 @@ static int vnc_process_messages(struct VncClientState *vcs)
 	vnc_send_custom_cursor(vcs);
 	vpm->vpm_cursor_update = 0;
     }
+
+    maxy = vs->visible_y + vs->visible_h;
+    if (maxy > vs->ds->height)
+	maxy = vs->ds->height;
+    maxx = vs->visible_x + vs->visible_w;
+    if (maxx > vs->ds->width)
+	maxx = vs->ds->width;
+
+    for (y = vs->visible_y; y < maxy; y++) {
+	int x, h;
+	for (x = X2DP_DOWN(vs, vs->visible_x);
+	     x < X2DP_UP(vs, maxx); x++) {
+	    uint64_t mask = 1ULL << x;
+	    if (vcs->update_row[y] & mask) {
+		h = find_update_height(vs, vcs->update_row, y, maxy, mask);
+		if (h != 0) {
+		    send_framebuffer_update(vcs, DP2X(vs, x), y,
+					    DP2X(vs, 1), h);
+		}
+	    }
+	}
+	vcs->update_row[y] = 0;
+    }
+
     if (vpm->vpm_region_updates) {
 	uint16_t n_rects;
 	struct vnc_pm_region_update *rup;
@@ -1368,8 +1372,10 @@ static void scan_event(VncState *vs, int down, uint32_t code)
 
 static void framebuffer_set_updated(VncState *vs, int x, int y, int w, int h)
 {
-
-    set_bits_in_row(vs, vs->update_row, x, y, w, h);
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++)
+	if (VCS_ACTIVE(vs->vcs[i]))
+	    set_bits_in_row(vs, vs->vcs[i]->update_row, x, y, w, h);
 
     vs->has_update = 1;
 }
@@ -1387,7 +1393,6 @@ static void framebuffer_update_request(struct VncClientState *vcs,
     vs->visible_y = 0;
     vs->visible_w = vs->ds->width;
     vs->visible_h = vs->ds->height;
-    vs->update_requested = 1;
 
     vs->ds->set_timer(vs->timer, vs->ds->get_clock());
 }
@@ -1589,7 +1594,6 @@ static int protocol_client_msg(struct VncClientState *vcs, uint8_t *data,
 	if (len == 1)
 	    return 8;
 
-        vs->update_requested = 1;
 	vs->timer_interval = VNC_REFRESH_INTERVAL_BASE;
 	vs->ds->set_timer(vs->timer, vs->ds->get_clock() + vs->timer_interval);
 	key_event(vs, read_u8(data, 1), read_u32(data, 4));
@@ -1598,7 +1602,6 @@ static int protocol_client_msg(struct VncClientState *vcs, uint8_t *data,
 	if (len == 1)
 	    return 6;
 
-        vs->update_requested = 1;
 	vs->timer_interval = VNC_REFRESH_INTERVAL_BASE;
 	vs->ds->set_timer(vs->timer, vs->ds->get_clock() + vs->timer_interval);
 	pointer_event(vcs, read_u8(data, 1), read_u16(data, 2),
@@ -1621,7 +1624,6 @@ static int protocol_client_msg(struct VncClientState *vcs, uint8_t *data,
 	if (len == 1)
 	    return 8;
 
-	vs->update_requested = 1;
 	vs->timer_interval = VNC_REFRESH_INTERVAL_BASE;
 	vs->ds->set_timer(vs->timer, vs->ds->get_clock() + vs->timer_interval);
 	scan_event(vs, read_u8(data, 1), read_u32(data, 4));
@@ -1816,6 +1818,14 @@ static void vnc_listen_read(void *opaque)
 	    goto fail;
     }
 
+    free(vs->vcs[i]->update_row);
+    vs->vcs[i]->update_row = qemu_mallocz(vs->ds->height * sizeof(vs->vcs[i]->update_row[0]));
+    if (!vs->vcs[i]->update_row) {
+        free(vs->vcs[i]);
+        vs->vcs[i] = NULL;
+        goto fail;
+    }
+
     vcs = vs->vcs[i];
     vcs->vs = vs;
     vcs->vpm.vpm_region_updates_last = &vcs->vpm.vpm_region_updates;
@@ -1874,6 +1884,7 @@ int vnc_display_init(DisplayState *ds, struct sockaddr *addr,
     int reuse_addr, ret;
     socklen_t addrlen;
     VncState *vs;
+    in_port_t port = 0;
 
     vs = qemu_mallocz(sizeof(VncState));
     if (!vs)
@@ -1930,17 +1941,20 @@ int vnc_display_init(DisplayState *ds, struct sockaddr *addr,
 	}
     } else
 #endif
+ again:
     if (addr->sa_family == AF_INET) {
 	iaddr = (struct sockaddr_in *)addr;
 	addrlen = sizeof(struct sockaddr_in);
+
+	if (!port) {
+	    port = ntohs(iaddr->sin_port) + 5900;
+	}
 
 	vs->lsock = socket(PF_INET, SOCK_STREAM, 0);
 	if (vs->lsock == -1) {
 	    fprintf(stderr, "Could not create socket\n");
 	    exit(1);
 	}
-
-	iaddr->sin_port = htons(ntohs(iaddr->sin_port) + 5900);
 
 	reuse_addr = 1;
 	ret = setsockopt(vs->lsock, SOL_SOCKET, SO_REUSEADDR,
@@ -1957,16 +1971,29 @@ int vnc_display_init(DisplayState *ds, struct sockaddr *addr,
       ret = fcntl(vs->lsock, F_GETFD, NULL);
       fcntl(vs->lsock, F_SETFD, ret | FD_CLOEXEC);
 
-    while (bind(vs->lsock, addr, addrlen) == -1) {
-	if (errno == EADDRINUSE && find_unused && addr->sa_family == AF_INET) {
-	    iaddr->sin_port = htons(ntohs(iaddr->sin_port) + 1);
-	    continue;
+    do {
+	iaddr->sin_port = htons(port);
+	ret = bind(vs->lsock, addr, addrlen);
+	if (ret == -1) {
+	    if (errno == EADDRINUSE && find_unused && addr->sa_family == AF_INET) {
+		port++;
+	    }
+	    else {
+	      break;
+	    }
 	}
+    } while (ret == -1);
+    if (ret == -1) {
 	fprintf(stderr, "bind() failed\n");
 	exit(1);
     }
 
     if (listen(vs->lsock, 1) == -1) {
+	if (errno == EADDRINUSE && find_unused && addr->sa_family == AF_INET) {
+	    close(vs->lsock);
+	    port++;
+	    goto again;
+	}
 	fprintf(stderr, "listen() failed\n");
 	exit(1);
     }
