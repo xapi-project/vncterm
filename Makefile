@@ -5,7 +5,7 @@ OBJS := main.o console.o
 LIBS_so := libvnc/libvnc.so
 LIBS := libvnc/libvnc.a
 
-CFLAGS  = -I$(shell pwd)/include
+CFLAGS  = -I$(shell pwd)/include -Wno-unused-result
 # _GNU_SOURCE for asprintf.
 CFLAGS += -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_GNU_SOURCE 
 CFLAGS += -Wall -Werror -g -O1 

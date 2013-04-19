@@ -43,11 +43,13 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
+
 
 #include <locale.h>
 
 #ifndef NXENSTORE
-#include <xs.h>
+#include <xenstore.h>
 #endif
 
 #if !defined(__APPLE__)
